@@ -19,6 +19,7 @@ import com.google.common.base.Preconditions;
 import com.google.common.base.Strings;
 import com.linkedin.pinot.common.config.QuotaConfig;
 import com.linkedin.pinot.common.config.TableConfig;
+import com.linkedin.pinot.common.config.TableNameBuilder;
 import com.linkedin.pinot.common.exception.InvalidConfigException;
 import com.linkedin.pinot.common.metrics.ControllerGauge;
 import com.linkedin.pinot.common.metrics.ControllerMetrics;
@@ -188,6 +189,102 @@ public class StorageQuotaChecker {
             "Storage quota exceeded for Table %s. New estimated size: %s > total allowed storage size: %s, where new estimated size = existing estimated uncompressed size of all replicas: %s - existing segment sizes of all replicas: %s + (incoming uncompressed segment size: %s * number replicas: %d), total allowed storage size = configured quota: %s * number replicas: %d",
             tableName, DataSize.fromBytes(estimatedFinalSizeBytes), DataSize.fromBytes(allowedStorageBytes), DataSize.fromBytes(tableSubtypeSize.estimatedSizeInBytes), DataSize.fromBytes(existingSegmentSizeBytes),
             DataSize.fromBytes(incomingSegmentSizeBytes), numReplicas, DataSize.fromBytes(quotaConfig.storageSizeBytes()), numReplicas);
+      }
+      LOGGER.warn(message);
+      return failure(message);
+    }
+  }
+
+  public QuotaCheckerResponse isBatchSegmentSizeWithinQuota(String offlineTableName, @Nonnull String[] segmentNames,
+      long totalIncomingSizeInBytes, @Nonnegative int timeoutMsec) throws InvalidConfigException {
+    QuotaConfig quotaConfig = _tableConfig.getQuotaConfig();
+    int numReplicas = _tableConfig.getValidationConfig().getReplicationNumber();
+    String rawTableName = TableNameBuilder.extractRawTableName(offlineTableName);
+
+    if (quotaConfig == null || Strings.isNullOrEmpty(quotaConfig.getStorage())) {
+      // no quota configuration...so ignore for backwards compatibility
+      LOGGER.warn("Quota configuration not set for table: {}", offlineTableName);
+      return success("Quota configuration not set for table: " + offlineTableName);
+    }
+
+    long allowedStorageBytes = numReplicas * quotaConfig.storageSizeBytes();
+    if (allowedStorageBytes < 0) {
+      LOGGER.warn("Storage quota is not configured for table: {}", offlineTableName);
+      return success("Storage quota is not configured for table: " + offlineTableName);
+    }
+    _controllerMetrics.setValueOfTableGauge(rawTableName, ControllerGauge.TABLE_QUOTA, allowedStorageBytes);
+
+    // read table size
+    TableSizeReader.TableSubTypeSizeDetails tableSubtypeSize = null;
+    try {
+      tableSubtypeSize = _tableSizeReader.getTableSubtypeSize(offlineTableName, timeoutMsec);
+    } catch (InvalidConfigException e) {
+      LOGGER.error("Failed to get table size for table {}", offlineTableName, e);
+      throw e;
+    }
+
+    if (tableSubtypeSize.estimatedSizeInBytes == -1) {
+      // don't fail the quota check in this case
+      return success("Missing size reports from all servers. Bypassing storage quota check for " + offlineTableName);
+    }
+
+    if (tableSubtypeSize.missingSegments > 0) {
+      if (tableSubtypeSize.estimatedSizeInBytes > allowedStorageBytes) {
+        return failure("Table " + offlineTableName + " already over quota. Estimated size for all replicas is "
+            + DataSize.fromBytes(tableSubtypeSize.estimatedSizeInBytes) + ". Configured size for " + numReplicas + " is "
+            + DataSize.fromBytes(allowedStorageBytes));
+      } else {
+        return success( "Missing size report for " + tableSubtypeSize.missingSegments
+            + " segments. Bypassing storage quota check for " + offlineTableName);
+      }
+    }
+
+    // Since tableNameWithType comes with the table type(OFFLINE), thus we guarantee that
+    // tableSubtypeSize.estimatedSizeInBytes is the offline table size.
+    _controllerMetrics.setValueOfTableGauge(rawTableName, ControllerGauge.OFFLINE_TABLE_ESTIMATED_SIZE,
+        tableSubtypeSize.estimatedSizeInBytes);
+    LOGGER.info("Table {}'s estimatedSizeInBytes is {}. ReportedSizeInBytes (actual reports from servers) is {}",
+        rawTableName, tableSubtypeSize.estimatedSizeInBytes, tableSubtypeSize.reportedSizeInBytes);
+
+    // Only emit the real percentage of storage quota usage by lead controller, otherwise emit 0L.
+    if (_pinotHelixResourceManager.isLeader() && allowedStorageBytes != 0L) {
+      long existingStorageQuotaUtilization = tableSubtypeSize.estimatedSizeInBytes  * 100 / allowedStorageBytes;
+      _controllerMetrics.setValueOfTableGauge(rawTableName, ControllerGauge.TABLE_STORAGE_QUOTA_UTILIZATION,
+          existingStorageQuotaUtilization);
+    } else {
+      _controllerMetrics.setValueOfTableGauge(rawTableName, ControllerGauge.TABLE_STORAGE_QUOTA_UTILIZATION, 0L);
+    }
+
+    long existingSegmentSizeBytes = 0L;
+    for (String segmentName : segmentNames) {
+      // If the segment exists(refresh), get the existing size
+      TableSizeReader.SegmentSizeDetails sizeDetails = tableSubtypeSize.segments.get(segmentName);
+      if (sizeDetails != null) {
+        existingSegmentSizeBytes += sizeDetails.estimatedSizeInBytes;
+      }
+    }
+    // Note: totalIncomingSizeInBytes is uncompressed data size for just 1 replica,
+    // while estimatedFinalSizeBytes is for all replicas of all segments put together.
+    long totalIncomingSegmentSizeBytes = totalIncomingSizeInBytes * numReplicas;
+    long estimatedFinalSizeBytes =
+        tableSubtypeSize.estimatedSizeInBytes - existingSegmentSizeBytes + totalIncomingSegmentSizeBytes;
+    if (estimatedFinalSizeBytes <= allowedStorageBytes) {
+      String message = String.format("Segment batch upload of Table %s is within quota. Total allowed storage size: %s ( = configured quota: %s * number replicas: %d). New estimated table size of all replicas: %s. Current table size of all replicas: %s. Incoming uncompressed batched segment sizes of all replicas: %s ( = single incoming uncompressed batched segment sizes: %s * number replicas: %d). Formula: New estimated size = current table size + incoming segment size",
+          rawTableName, DataSize.fromBytes(allowedStorageBytes), DataSize.fromBytes(quotaConfig.storageSizeBytes()), numReplicas, DataSize.fromBytes(estimatedFinalSizeBytes), DataSize.fromBytes(tableSubtypeSize.estimatedSizeInBytes), DataSize.fromBytes(totalIncomingSegmentSizeBytes), DataSize.fromBytes(totalIncomingSegmentSizeBytes), numReplicas);
+      LOGGER.info(message);
+      return success(message);
+    } else {
+      String message;
+      if (tableSubtypeSize.estimatedSizeInBytes > allowedStorageBytes) {
+        message = String.format(
+            "Table %s already over quota. Existing estimated uncompressed table size of all replicas: %s > total allowed storage size: %s ( = configured quota: %s * num replicas: %d). Check if indexes were enabled recently and adjust table quota accordingly.",
+            rawTableName, DataSize.fromBytes(tableSubtypeSize.estimatedSizeInBytes), DataSize.fromBytes(allowedStorageBytes), DataSize.fromBytes(quotaConfig.storageSizeBytes()),
+            numReplicas);
+      } else {
+        message = String.format(
+            "Storage quota exceeded for Table %s. New estimated size: %s > total allowed storage size: %s, where new estimated size = existing estimated uncompressed size of all replicas: %s - existing segment sizes of all replicas: %s + (incoming uncompressed batched segment sizes: %s * number replicas: %d), total allowed storage size = configured quota: %s * number replicas: %d",
+            rawTableName, DataSize.fromBytes(estimatedFinalSizeBytes), DataSize.fromBytes(allowedStorageBytes), DataSize.fromBytes(tableSubtypeSize.estimatedSizeInBytes), DataSize.fromBytes(existingSegmentSizeBytes),
+            DataSize.fromBytes(totalIncomingSegmentSizeBytes), numReplicas, DataSize.fromBytes(quotaConfig.storageSizeBytes()), numReplicas);
       }
       LOGGER.warn(message);
       return failure(message);

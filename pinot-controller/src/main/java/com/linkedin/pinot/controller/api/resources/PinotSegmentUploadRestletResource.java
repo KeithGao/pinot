@@ -15,7 +15,11 @@
  */
 package com.linkedin.pinot.controller.api.resources;
 
+import com.google.common.base.Preconditions;
+import com.linkedin.pinot.common.config.TableConfig;
 import com.linkedin.pinot.common.config.TableNameBuilder;
+import com.linkedin.pinot.common.exception.InvalidConfigException;
+import com.linkedin.pinot.common.metadata.ZKMetadataProvider;
 import com.linkedin.pinot.common.metrics.ControllerMeter;
 import com.linkedin.pinot.common.metrics.ControllerMetrics;
 import com.linkedin.pinot.common.segment.SegmentMetadata;
@@ -23,19 +27,25 @@ import com.linkedin.pinot.common.segment.fetcher.SegmentFetcherFactory;
 import com.linkedin.pinot.common.utils.CommonConstants;
 import com.linkedin.pinot.common.utils.FileUploadDownloadClient;
 import com.linkedin.pinot.common.utils.StringUtil;
+import com.linkedin.pinot.common.utils.TarGzCompressionUtils;
 import com.linkedin.pinot.common.utils.helix.HelixHelper;
 import com.linkedin.pinot.controller.ControllerConf;
 import com.linkedin.pinot.controller.api.access.AccessControl;
 import com.linkedin.pinot.controller.api.access.AccessControlFactory;
+import com.linkedin.pinot.controller.api.upload.SegmentUploadHelper;
 import com.linkedin.pinot.controller.api.upload.SegmentValidator;
 import com.linkedin.pinot.controller.api.upload.ZKOperator;
 import com.linkedin.pinot.controller.helix.core.PinotHelixResourceManager;
 import com.linkedin.pinot.controller.helix.core.PinotHelixSegmentOnlineOfflineStateModelGenerator;
+import com.linkedin.pinot.controller.util.TableSizeReader;
+import com.linkedin.pinot.controller.validation.StorageQuotaChecker;
 import com.linkedin.pinot.core.crypt.NoOpPinotCrypter;
 import com.linkedin.pinot.core.crypt.PinotCrypter;
 import com.linkedin.pinot.core.crypt.PinotCrypterFactory;
 import com.linkedin.pinot.core.metadata.DefaultMetadataExtractor;
 import com.linkedin.pinot.core.metadata.MetadataExtractorFactory;
+import com.linkedin.pinot.filesystem.PinotFS;
+import com.linkedin.pinot.filesystem.PinotFSFactory;
 import io.swagger.annotations.Api;
 import io.swagger.annotations.ApiOperation;
 import io.swagger.annotations.ApiParam;
@@ -49,10 +59,13 @@ import java.net.InetAddress;
 import java.net.URI;
 import java.net.URLDecoder;
 import java.net.URLEncoder;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 import java.util.concurrent.Executor;
 import javax.inject.Inject;
+import javax.validation.constraints.NotNull;
 import javax.ws.rs.Consumes;
 import javax.ws.rs.DELETE;
 import javax.ws.rs.DefaultValue;
@@ -82,6 +95,8 @@ import org.json.JSONArray;
 import org.json.JSONObject;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
+import static com.linkedin.pinot.common.utils.TarGzCompressionUtils.*;
 
 
 @Api(tags = Constants.SEGMENT_TAG)
@@ -390,6 +405,30 @@ public class PinotSegmentUploadRestletResource {
     pinotCrypter.decrypt(tempEncryptedFile, tempDecryptedFile);
   }
 
+  private void completeBatchUploadSegmentOperations(HttpHeaders headers,
+      File tempDecryptedFile, FileUploadPathProvider provider, SegmentMetadata segmentMetadata,
+      String segmentName, String zkDownloadURI, String batchId) throws Exception {
+
+    // Only keep and tar metadata file.
+    File segmentMetadataDir = segmentMetadata.getIndexDir();
+    File indexFile = new File(segmentMetadataDir, "v3/columns.psf");
+    FileUtils.forceDelete(indexFile);
+    TarGzCompressionUtils.createTarGzOfDirectory(segmentMetadataDir.toString());
+    File segmentMetadataTarFile = new File(segmentMetadataDir.toString() + TAR_GZ_FILE_EXTENSION);
+
+    // generates compressed segment URI
+    String batchUploadSegmentPath = StringUtil.join("/", provider.getBaseDataDirURI().toString(), segmentMetadata.getTableName(),
+        batchId, "segment", URLEncoder.encode(segmentName, "UTF-8"));
+    URI batchUploadSegmentPathURI = new URI(batchUploadSegmentPath);
+    // generates metadata URI
+    String batchUploadSegmentMetadataPath = StringUtil.join("/", provider.getBaseDataDirURI().toString(),
+        segmentMetadata.getTableName(), batchId, "metadata", URLEncoder.encode(segmentName, "UTF-8"));
+    URI batchUploadSegmentMetadataURI = new URI(batchUploadSegmentMetadataPath);
+    SegmentUploadHelper segmentUploadHelper = new SegmentUploadHelper();
+    segmentUploadHelper.uploadSegment(segmentMetadata, tempDecryptedFile, batchUploadSegmentPathURI,
+        segmentMetadataTarFile, batchUploadSegmentMetadataURI, true, headers, zkDownloadURI);
+  }
+
   @POST
   @ManagedAsync
   @Produces(MediaType.APPLICATION_JSON)
@@ -459,6 +498,314 @@ public class PinotSegmentUploadRestletResource {
       asyncResponse.resume(uploadSegment(multiPart, enableParallelPushProtection, headers, request, true));
     } catch (Throwable t) {
       asyncResponse.resume(t);
+    }
+  }
+
+  @POST
+  @ManagedAsync
+  @Produces(MediaType.APPLICATION_JSON)
+  @Consumes(MediaType.APPLICATION_JSON)
+  @Path("/batch/{tableName}")
+  @ApiOperation(value = "Start/Cancel/Finish batch upload", notes = "Start/Cancel/Finish batch upload segments for a table")
+  public void batchUploadSegments(
+      @ApiParam(value = "Name of the table", required = true) @PathParam("tableName") String tableName,
+      @ApiParam(value = "List of segment names to be uploaded, separated by \";\"") @QueryParam("segmentNames") String segmentNames,
+      @ApiParam(value = "Total size in bytes of segments to be uploaded") @QueryParam("totalSize") long totalSize,
+      @ApiParam(value = "State of the batch upload", required = true, allowableValues = "start, cancel, finish") @QueryParam("state") String state,
+      @ApiParam(value = "Batch Id") @QueryParam("batchId") String batchId,
+      @Context HttpHeaders headers, @Context Request request, @Suspended final AsyncResponse asyncResponse) {
+    try {
+      BatchUploadType uploadType = BatchUploadType.getBatchUploadType(state);
+      if (uploadType == null) {
+        throw new ControllerApplicationException(LOGGER,
+            String.format("Invalid state value: %s. Should be either start or finish", state),
+            Response.Status.BAD_REQUEST);
+      }
+      switch (uploadType) {
+        case START:
+          asyncResponse.resume(startBatchUploadSegmentsForTable(tableName, segmentNames, totalSize));
+          break;
+        case CANCEL:
+          asyncResponse.resume(cancelBatchUploadSegmentsForTable(tableName, batchId));
+          break;
+        case FINISH:
+          asyncResponse.resume(finishBatchUploadSegmentsForTable(tableName, batchId));
+          break;
+        default:
+          break;
+      }
+    } catch (Throwable t) {
+      asyncResponse.resume(t);
+    }
+  }
+
+  @POST
+  @ManagedAsync
+  @Produces(MediaType.APPLICATION_JSON)
+  @Consumes(MediaType.MULTIPART_FORM_DATA)
+  @Path("/batch/{tableName}/{batchId}")
+  @ApiOperation(value = "Upload segment in batch", notes = "Upload segment for a table in batch mode")
+  public void uploadSegmentInBatchMode(FormDataMultiPart multiPart,
+      @ApiParam(value = "Name of the table", required = true) @PathParam("tableName") String tableName,
+      @ApiParam(value = "Batch Id", required = true) @PathParam("batchId") String batchId,
+      @Context HttpHeaders headers, @Context Request request, @Suspended final AsyncResponse asyncResponse) {
+    try {
+      asyncResponse.resume(uploadSegmentsInBatchForTable(tableName, batchId, request, multiPart, headers));
+    } catch (Throwable t) {
+      asyncResponse.resume(t);
+    }
+  }
+
+  private SuccessResponse startBatchUploadSegmentsForTable(String tableName, String segmentNamesString,
+      long totalSize) {
+    Preconditions.checkNotNull(tableName);
+    Preconditions.checkNotNull(segmentNamesString);
+    Preconditions.checkArgument(totalSize > 0L,
+        String.format("Total incoming batched segment sizes should be > 0, input: %d", totalSize));
+    String rawTableName = TableNameBuilder.extractRawTableName(tableName);
+    String offlineTableName = TableNameBuilder.OFFLINE.tableNameWithType(rawTableName);
+    String[] segmentNames = segmentNamesString.split(";");
+
+    TableConfig offlineTableConfig =
+        ZKMetadataProvider.getOfflineTableConfig(_pinotHelixResourceManager.getPropertyStore(), offlineTableName);
+
+    LOGGER.info("Start checking quota config for table: {}", rawTableName);
+    StorageQuotaChecker.QuotaCheckerResponse quotaCheckerResponse;
+    try {
+      TableSizeReader tableSizeReader =
+          new TableSizeReader(_executor, _connectionManager, _controllerMetrics, _pinotHelixResourceManager);
+      StorageQuotaChecker quotaChecker =
+          new StorageQuotaChecker(offlineTableConfig, tableSizeReader, _controllerMetrics, _pinotHelixResourceManager);
+
+      quotaCheckerResponse = quotaChecker.isBatchSegmentSizeWithinQuota(offlineTableName, segmentNames, totalSize,
+          _controllerConf.getServerAdminRequestTimeoutSeconds() * 1000);
+    } catch (InvalidConfigException ie) {
+      throw new ControllerApplicationException(LOGGER,
+          "Quota check failed for batch upload segments of table: " + offlineTableName + ", reason: " + ie.getMessage(),
+          Response.Status.INTERNAL_SERVER_ERROR);
+    }
+
+    if (!quotaCheckerResponse.isSegmentWithinQuota) {
+      throw new ControllerApplicationException(LOGGER,
+          "Quota check failed for batch upload segments of table: " + offlineTableName + ", reason: "
+              + quotaCheckerResponse.reason, Response.Status.FORBIDDEN);
+    }
+
+    // Batch upload is within storage quota.
+    try {
+      // Generate batchId.
+      String batchId = UUID.randomUUID().toString();
+      FileUploadPathProvider provider = new FileUploadPathProvider(_controllerConf);
+
+      // Create dir for batch upload.
+      String finalBatchUploadPath = StringUtil.join("/", provider.getBaseDataDirURI().toString(), rawTableName,
+          URLEncoder.encode(batchId, "UTF-8"));
+      URI batchUploadLocationURI = new URI(finalBatchUploadPath);
+      PinotFS pinotFS = PinotFSFactory.create(batchUploadLocationURI.getScheme());
+      pinotFS.mkdir(batchUploadLocationURI);
+      return new SuccessResponse(
+          "Successfully initialized batch upload segments of table: " + rawTableName + ". BatchId: "
+              + batchId);
+    } catch (Exception e) {
+      throw new ControllerApplicationException(LOGGER,
+          "Unable to initialize batch upload of table: " + rawTableName + ", reason: " + e.getMessage(),
+          Response.Status.INTERNAL_SERVER_ERROR);
+    }
+  }
+
+  private SuccessResponse uploadSegmentsInBatchForTable(String tableName, String batchId, Request request,
+      FormDataMultiPart multiPart, HttpHeaders headers) {
+    Preconditions.checkNotNull(tableName, "Table name should not be null!");
+    Preconditions.checkNotNull(batchId, "Batch id should not be null!");
+
+    // Get upload type
+    String uploadTypeStr = headers.getHeaderString(FileUploadDownloadClient.CustomHeaders.UPLOAD_TYPE);
+    FileUploadDownloadClient.FileUploadType uploadType = getUploadType(uploadTypeStr);
+
+    // Get crypter class
+    String crypterClassHeader = headers.getHeaderString(FileUploadDownloadClient.CustomHeaders.CRYPTER);
+
+    // Get URI of current segment location
+    String currentSegmentLocationURI = headers.getHeaderString(FileUploadDownloadClient.CustomHeaders.DOWNLOAD_URI);
+
+    File tempEncryptedFile = null;
+    File tempDecryptedFile = null;
+    File tempSegmentDir = null;
+    SegmentMetadata segmentMetadata;
+    String zkDownloadUri = null;
+    try {
+      FileUploadPathProvider provider = new FileUploadPathProvider(_controllerConf);
+      String tempFileName = TMP_DIR_PREFIX + System.nanoTime();
+      tempDecryptedFile = new File(provider.getFileUploadTmpDir(), tempFileName);
+      tempSegmentDir = new File(provider.getTmpUntarredPath(), tempFileName);
+
+      // Set default crypter to the noop crypter when no crypter header is sent
+      // In this case, the noop crypter will not do any operations, so the encrypted and decrypted file will have the same
+      // file path.
+      if (crypterClassHeader == null) {
+        crypterClassHeader = NoOpPinotCrypter.class.getSimpleName();
+        tempEncryptedFile = new File(provider.getFileUploadTmpDir(), tempFileName);
+      } else {
+        tempEncryptedFile = new File(provider.getFileUploadTmpDir(), tempFileName + ENCRYPTED_SUFFIX);
+      }
+
+      // TODO: Change when metadata upload added
+      String metadataProviderClass = DefaultMetadataExtractor.class.getName();
+
+      switch (uploadType) {
+        case URI:
+          segmentMetadata =
+              getMetadataForURI(crypterClassHeader, currentSegmentLocationURI, tempEncryptedFile, tempDecryptedFile,
+                  tempSegmentDir, metadataProviderClass);
+          break;
+        case SEGMENT:
+          getFileFromMultipart(multiPart, tempDecryptedFile);
+          segmentMetadata = getSegmentMetadata(crypterClassHeader, tempEncryptedFile, tempDecryptedFile, tempSegmentDir,
+              metadataProviderClass);
+          break;
+        default:
+          throw new UnsupportedOperationException("Unsupported upload type: " + uploadType);
+      }
+
+      zkDownloadUri = getZkDownloadURIForSegmentUpload(segmentMetadata, provider);
+
+
+      String clientAddress = InetAddress.getByName(request.getRemoteAddr()).getHostName();
+      String segmentName = segmentMetadata.getName();
+      String offlineTableName = TableNameBuilder.OFFLINE.tableNameWithType(segmentMetadata.getTableName());
+      LOGGER.info("Processing upload request for segment: {} of table: {} from client: {}", segmentName,
+          offlineTableName, clientAddress);
+
+      // Validate segment
+      new SegmentValidator(_pinotHelixResourceManager, _controllerConf, _executor, _connectionManager,
+          _controllerMetrics).validateSegment(segmentMetadata, tempSegmentDir);
+
+
+
+
+      // Zk operations
+      completeBatchUploadSegmentOperations(headers, tempEncryptedFile, provider, segmentMetadata,
+          segmentName, zkDownloadUri, batchId);
+
+      return new SuccessResponse("Successfully uploaded segment: " + segmentMetadata.getName() + " of table: "
+          + segmentMetadata.getTableName());
+    } catch (WebApplicationException e) {
+      throw e;
+    } catch (Exception e) {
+      _controllerMetrics.addMeteredGlobalValue(ControllerMeter.CONTROLLER_SEGMENT_UPLOAD_ERROR, 1L);
+      throw new ControllerApplicationException(LOGGER, "Caught internal server exception while uploading segment",
+          Response.Status.INTERNAL_SERVER_ERROR, e);
+    } finally {
+      FileUtils.deleteQuietly(tempEncryptedFile);
+      FileUtils.deleteQuietly(tempDecryptedFile);
+      FileUtils.deleteQuietly(tempSegmentDir);
+    }
+  }
+
+  private SuccessResponse cancelBatchUploadSegmentsForTable(String tableName, String batchId) {
+    Preconditions.checkNotNull(tableName, "Table name should not be null!");
+    Preconditions.checkNotNull(batchId, "Batch id should not be null!");
+    String rawTableName = TableNameBuilder.extractRawTableName(tableName);
+
+    try {
+      FileUploadPathProvider provider = new FileUploadPathProvider(_controllerConf);
+      String batchUploadPath = StringUtil.join("/", provider.getBaseDataDirURI().toString(), rawTableName,
+          URLEncoder.encode(batchId, "UTF-8"));
+      URI batchUploadLocationURI = new URI(batchUploadPath);
+      PinotFS pinotFS = PinotFSFactory.create(batchUploadLocationURI.getScheme());
+      if (!pinotFS.exists(batchUploadLocationURI)) {
+        throw new ControllerApplicationException(LOGGER,
+            String.format("Batch location for batchId: %s doesn't exist", batchId),
+            Response.Status.INTERNAL_SERVER_ERROR);
+      }
+
+      LOGGER.info("Deleting batch directory {}", batchUploadPath);
+      pinotFS.delete(batchUploadLocationURI);
+
+      return new SuccessResponse("Successfully canceled batch upload segments of table: " + rawTableName + ". BatchId: "
+          + batchId);
+    } catch(WebApplicationException we) {
+      throw we;
+    } catch (Exception e) {
+      throw new ControllerApplicationException(LOGGER,
+          "Unable to cancel batch upload of table: " + rawTableName + ", reason: " + e.getMessage(),
+          Response.Status.INTERNAL_SERVER_ERROR);
+    }
+  }
+
+  private SuccessResponse finishBatchUploadSegmentsForTable(String tableName, String batchId) {
+    Preconditions.checkNotNull(tableName, "Table name should not be null!");
+    Preconditions.checkNotNull(batchId, "Batch id should not be null!");
+
+    String rawTableName = TableNameBuilder.extractRawTableName(tableName);
+    String offlineTableName = TableNameBuilder.OFFLINE.tableNameWithType(rawTableName);
+    String metadataProviderClass = DefaultMetadataExtractor.class.getName();
+
+    try {
+      FileUploadPathProvider provider = new FileUploadPathProvider(_controllerConf);
+      String batchUploadPath = StringUtil.join("/", provider.getBaseDataDirURI().toString(), rawTableName,
+          URLEncoder.encode(batchId, "UTF-8"));
+      URI batchUploadLocationURI = new URI(batchUploadPath);
+      PinotFS pinotFS = PinotFSFactory.create(batchUploadLocationURI.getScheme());
+      if (!pinotFS.exists(batchUploadLocationURI)) {
+        throw new ControllerApplicationException(LOGGER,
+            String.format("Batch location for batchId: %s doesn't exist", batchId),
+            Response.Status.INTERNAL_SERVER_ERROR);
+      }
+
+      String finalLocationPath = StringUtil.join("/", provider.getBaseDataDirURI().toString(), rawTableName);
+      String currentSegmentMetadataLocationPath = StringUtil.join("/", batchUploadPath, "metadata");
+      URI currentSegmentMetadataLocationURI = new URI(currentSegmentMetadataLocationPath);
+
+      String tempFileName = TMP_DIR_PREFIX + System.nanoTime();
+      File tempDir = new File(provider.getFileUploadTmpDir(), tempFileName);
+      tempDir.mkdir();
+      File tempTarDir = new File(tempDir, "tar");
+      File tempMetadataDir = new File(tempDir, "metadata");
+
+      // UnTar segment metadata.
+      List<SegmentMetadata> segmentMetadataList = new ArrayList<>();
+      String[] tarFiles = pinotFS.listFiles(currentSegmentMetadataLocationURI);
+      for (String file : tarFiles) {
+        String[] tmp = file.split("/");
+        String segmentName = tmp[tmp.length - 1];
+        File tempDecryptedFile = new File(tempTarDir, segmentName);
+        pinotFS.copyToLocalFile(new URI(file), tempDecryptedFile);
+
+        SegmentMetadata segmentMetadata = MetadataExtractorFactory.create(metadataProviderClass).extractMetadata(tempDecryptedFile, tempMetadataDir);
+        segmentMetadataList.add(segmentMetadata);
+
+      }
+
+      long startTime = System.currentTimeMillis();
+      LOGGER.info("Moving {} files of table {} from batch location {} to final location {}", segmentMetadataList.size(), offlineTableName, batchUploadPath, finalLocationPath);
+      for (SegmentMetadata segmentMetadata : segmentMetadataList) {
+        String segmentName = segmentMetadata.getName();
+        String currentSegmentLocationPath = StringUtil.join("/", batchUploadPath, "segment", segmentMetadata.getTableName(), segmentName);
+        URI currentSegmentLocationURI = new URI(currentSegmentLocationPath);
+        String finalSegmentLocationPath = StringUtil.join("/", finalLocationPath, segmentMetadata.getTableName(), segmentName);
+        URI finalSegmentLocationURI = new URI(finalSegmentLocationPath);
+        pinotFS.move(currentSegmentLocationURI, finalSegmentLocationURI);
+      }
+      LOGGER.info("Finished moving segments of table {} in {}ms", offlineTableName, (System.currentTimeMillis() - startTime));
+
+      long startUpdateZKTime = System.currentTimeMillis();
+      LOGGER.info("Start to update zk metadata and ideal state of table {}", offlineTableName);
+      //TODO: Update zk metadata and ideal state.
+      LOGGER.info("Finished updating zk metadata and ideal state of table {} in {}ms", offlineTableName, (System.currentTimeMillis() - startUpdateZKTime));
+
+      //clean up batch upload directory.
+      LOGGER.info("Deleting batch upload directory {}", batchUploadPath);
+      pinotFS.delete(batchUploadLocationURI);
+
+      return new SuccessResponse("Successfully batch uploaded " + segmentMetadataList.size() + " segments of table: " + rawTableName + ". BatchId: "
+          + batchId);
+    } catch(WebApplicationException we) {
+      throw we;
+    } catch (Exception e) {
+      throw new ControllerApplicationException(LOGGER,
+          "Unable to finish batch upload of table: " + rawTableName + ", reason: " + e.getMessage(),
+          Response.Status.INTERNAL_SERVER_ERROR);
     }
   }
 
