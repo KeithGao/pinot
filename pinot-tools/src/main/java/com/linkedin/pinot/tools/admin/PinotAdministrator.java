@@ -19,6 +19,7 @@ import com.linkedin.pinot.tools.admin.command.ApplyTableConfigCommand;
 import com.linkedin.pinot.tools.admin.command.MoveReplicaGroup;
 
 import com.linkedin.pinot.tools.admin.command.RealtimeProvisioningHelperCommand;
+import com.linkedin.pinot.tools.admin.command.SegmentMergeCommand;
 import java.lang.reflect.Field;
 
 import org.kohsuke.args4j.Argument;
@@ -96,7 +97,8 @@ public class PinotAdministrator {
       @SubCommand(name = "BackfillSegmentColumn", impl = BackfillDateTimeColumnCommand.class),
       @SubCommand(name = "VerifyClusterState", impl = VerifyClusterStateCommand.class),
       @SubCommand(name = "ApplyTableConfig", impl = ApplyTableConfigCommand.class),
-      @SubCommand(name = "RealtimeProvisioningHelper", impl = RealtimeProvisioningHelperCommand.class)
+      @SubCommand(name = "RealtimeProvisioningHelper", impl = RealtimeProvisioningHelperCommand.class),
+      @SubCommand(name = "SegmentMerge", impl = SegmentMergeCommand.class)
   })
   Command _subCommand;
   // @formatter:on
